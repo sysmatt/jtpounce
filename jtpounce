@@ -145,8 +145,10 @@ def is_directed_to(message, callsign):
         return False
     parts = message.strip().upper().split()
     target = callsign.upper()
-    match = len(parts) >= 2 and parts[1] == target
-    dbg(f"is_directed_to: parts={parts}  looking for {target!r} at [1]  -> {match}")
+    # FT8/FT4 format: "<CALLEDSTATION> <CALLINGSTATION> <REPORT/GRID>"
+    # The addressed station is always the first token.
+    match = len(parts) >= 2 and parts[0] == target
+    dbg(f"is_directed_to: parts={parts}  looking for {target!r} at [0]  -> {match}")
     return match
 
 
