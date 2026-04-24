@@ -24,6 +24,13 @@ import socket
 import struct
 import sys
 
+DEBUG = False
+
+
+def dbg(*args, **kwargs):
+    if DEBUG:
+        print("[DBG]", *args, **kwargs)
+
 # ── WSJT-X protocol constants ────────────────────────────────────────────────
 WSJTX_MAGIC  = 0xADBCCBDA
 WSJTX_SCHEMA = 2
@@ -67,7 +74,8 @@ def parse_decode(buf):
     if len(buf) < 12:
         return None
     try:
-        magic, _schema, msg_type = struct.unpack_from(">III", buf, 0)
+        magic, schema, msg_type = struct.unpack_from(">III", buf, 0)
+        dbg(f"header: magic=0x{magic:08X} schema={schema} type={msg_type} buflen={len(buf)}")
         if magic != WSJTX_MAGIC or msg_type != MSG_DECODE:
             return None
         pos = 12
@@ -80,6 +88,9 @@ def parse_decode(buf):
         mode,       pos  = _unpack_str(buf, pos)
         message,    pos  = _unpack_str(buf, pos)
         low_conf         = struct.unpack_from(">B", buf, pos)[0]; pos += 1
+        dbg(f"  id={wsjtx_id!r} new={new_decode} time_ms={time_ms} snr={snr} "
+            f"dt={delta_time:.1f} df={delta_freq} mode={mode!r}")
+        dbg(f"  message raw repr: {message!r}")
         return dict(
             wsjtx_id=wsjtx_id,
             time_ms=time_ms,
@@ -90,7 +101,8 @@ def parse_decode(buf):
             message=message,
             low_conf=low_conf,
         )
-    except struct.error:
+    except struct.error as e:
+        dbg(f"parse_decode struct.error: {e}  buf={buf.hex()}")
         return None
 
 
@@ -129,9 +141,13 @@ def is_directed_to(message, callsign):
       W2XYZ W1ABC 73
     """
     if not message:
+        dbg("is_directed_to: empty message")
         return False
     parts = message.strip().upper().split()
-    return len(parts) >= 2 and parts[1] == callsign.upper()
+    target = callsign.upper()
+    match = len(parts) >= 2 and parts[1] == target
+    dbg(f"is_directed_to: parts={parts}  looking for {target!r} at [1]  -> {match}")
+    return match
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -152,7 +168,14 @@ def main():
         help=f"Join multicast group {MULTICAST_GROUP} "
              "(use when WSJT-X is configured to send to that group)",
     )
+    ap.add_argument(
+        "--debug", action="store_true",
+        help="Print raw decode fields and matching details to stdout",
+    )
     args = ap.parse_args()
+
+    global DEBUG
+    DEBUG = args.debug
 
     my_call = args.callsign.upper()
 
