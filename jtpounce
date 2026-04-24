@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""
+jtpounce — Monitor WSJT-X UDP decodes and auto-reply the first time your
+callsign is heard, then exit.
+
+No third-party dependencies — uses only stdlib (socket, struct, argparse).
+
+How it works:
+  WSJT-X sends decode datagrams (type 2) to the configured UDP destination
+  (default 127.0.0.1:2237 or multicast 224.0.0.1:2237).  This script
+  binds to that port, watches every decoded message, and the moment it
+  sees one directed at YOUR callsign it sends a Reply datagram (type 4)
+  back to WSJT-X, which queues the outgoing transmission for the next TX
+  slot, then exits immediately.
+
+Usage:
+  ./jtpounce W1ABC
+  ./jtpounce W1ABC --port 2237
+  ./jtpounce W1ABC --multicast   # if WSJT-X uses 224.0.0.1
+"""
+
+import argparse
+import socket
+import struct
+import sys
+
+# ── WSJT-X protocol constants ────────────────────────────────────────────────
+WSJTX_MAGIC  = 0xADBCCBDA
+WSJTX_SCHEMA = 2
+
+MSG_HEARTBEAT = 0
+MSG_STATUS    = 1
+MSG_DECODE    = 2
+MSG_CLEAR     = 3
+MSG_REPLY     = 4   # we send this to make WSJT-X transmit a reply
+
+DEFAULT_PORT    = 2237
+MULTICAST_GROUP = "224.0.0.1"
+
+
+# ── Qt QDataStream string helpers ─────────────────────────────────────────────
+
+def _pack_str(s):
+    """Encode a Python str as a Qt QDataStream UTF-8 string."""
+    if s is None:
+        return struct.pack(">I", 0xFFFFFFFF)
+    b = s.encode("utf-8")
+    return struct.pack(">I", len(b)) + b
+
+
+def _unpack_str(buf, pos):
+    """Decode a Qt QDataStream UTF-8 string; return (value, new_pos)."""
+    (length,) = struct.unpack_from(">I", buf, pos)
+    pos += 4
+    if length == 0xFFFFFFFF:
+        return None, pos
+    return buf[pos : pos + length].decode("utf-8", errors="replace"), pos + length
+
+
+# ── Protocol: parse incoming Decode message ───────────────────────────────────
+
+def parse_decode(buf):
+    """
+    Parse a WSJT-X Decode datagram (schema ≥ 2).
+    Returns a dict of fields, or None if this is not a Decode message.
+    """
+    if len(buf) < 12:
+        return None
+    try:
+        magic, _schema, msg_type = struct.unpack_from(">III", buf, 0)
+        if magic != WSJTX_MAGIC or msg_type != MSG_DECODE:
+            return None
+        pos = 12
+        wsjtx_id,   pos = _unpack_str(buf, pos)
+        new_decode       = struct.unpack_from(">B", buf, pos)[0]; pos += 1
+        time_ms          = struct.unpack_from(">I", buf, pos)[0]; pos += 4
+        snr              = struct.unpack_from(">i", buf, pos)[0]; pos += 4
+        delta_time       = struct.unpack_from(">d", buf, pos)[0]; pos += 8
+        delta_freq       = struct.unpack_from(">I", buf, pos)[0]; pos += 4
+        mode,       pos  = _unpack_str(buf, pos)
+        message,    pos  = _unpack_str(buf, pos)
+        low_conf         = struct.unpack_from(">B", buf, pos)[0]; pos += 1
+        return dict(
+            wsjtx_id=wsjtx_id,
+            time_ms=time_ms,
+            snr=snr,
+            delta_time=delta_time,
+            delta_freq=delta_freq,
+            mode=mode,
+            message=message,
+            low_conf=low_conf,
+        )
+    except struct.error:
+        return None
+
+
+# ── Protocol: build outgoing Reply message ────────────────────────────────────
+
+def build_reply(d):
+    """
+    Build a WSJT-X Reply datagram (type 4) from a previously parsed decode
+    dict.  Sending this to WSJT-X causes it to queue an outgoing reply to
+    that station on the next TX slot.
+    """
+    pkt  = struct.pack(">III", WSJTX_MAGIC, WSJTX_SCHEMA, MSG_REPLY)
+    pkt += _pack_str(d["wsjtx_id"])
+    pkt += struct.pack(">I", d["time_ms"])
+    pkt += struct.pack(">i", d["snr"])
+    pkt += struct.pack(">d", d["delta_time"])
+    pkt += struct.pack(">I", d["delta_freq"])
+    pkt += _pack_str(d["mode"])
+    pkt += _pack_str(d["message"])
+    pkt += struct.pack(">B", d["low_conf"])
+    pkt += struct.pack(">B", 0)   # keyboard modifiers = none
+    return pkt
+
+
+# ── Callsign matching ─────────────────────────────────────────────────────────
+
+def is_directed_to(message, callsign):
+    """
+    Return True if the decoded message is directed to `callsign`.
+
+    FT8/FT4 directed format: "THEIRCALL OURCALL <report|grid|RRR|73>"
+    We match on position [1] so we catch:
+      W2XYZ W1ABC -07   (initial call with SNR report)
+      W2XYZ W1ABC R-07  (roger + SNR)
+      W2XYZ W1ABC RRR
+      W2XYZ W1ABC 73
+    """
+    if not message:
+        return False
+    parts = message.strip().upper().split()
+    return len(parts) >= 2 and parts[1] == callsign.upper()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Watch WSJT-X UDP decodes and auto-reply the first time "
+                    "your callsign is heard.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("callsign", help="Your callsign, e.g. W1ABC")
+    ap.add_argument(
+        "--port", type=int, default=DEFAULT_PORT,
+        help="UDP port that WSJT-X sends to (File → Settings → Reporting → UDP)",
+    )
+    ap.add_argument(
+        "--multicast", action="store_true",
+        help=f"Join multicast group {MULTICAST_GROUP} "
+             "(use when WSJT-X is configured to send to that group)",
+    )
+    args = ap.parse_args()
+
+    my_call = args.callsign.upper()
+
+    # ── Socket setup ──────────────────────────────────────────────────────────
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except AttributeError:
+        pass  # SO_REUSEPORT not available on Windows
+    sock.bind(("", args.port))
+    sock.settimeout(1.0)
+
+    if args.multicast:
+        mreq = struct.pack("4sL", socket.inet_aton(MULTICAST_GROUP), socket.INADDR_ANY)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        print(f"Joined multicast group {MULTICAST_GROUP}")
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+    wsjtx_addr = None   # learned from the first WSJT-X datagram we receive
+    replied    = False  # flip True after we send the first reply
+
+    print(f"Monitoring for calls to {my_call} on UDP port {args.port}")
+
+    try:
+        while True:
+            try:
+                buf, addr = sock.recvfrom(65536)
+            except socket.timeout:
+                continue
+
+            # Every valid WSJT-X datagram teaches us where to send replies.
+            if len(buf) >= 4 and struct.unpack_from(">I", buf, 0)[0] == WSJTX_MAGIC:
+                wsjtx_addr = addr
+
+            d = parse_decode(buf)
+            if d is None:
+                continue
+
+            msg = d["message"] or ""
+            print(f"  [{d['mode']:>3}]  {msg}")
+
+            if not replied and is_directed_to(msg, my_call):
+                if wsjtx_addr is None:
+                    # Shouldn't happen, but guard anyway
+                    print("  (WSJT-X address unknown — cannot send reply yet)")
+                    continue
+                print(f"\n  *** Heard: {msg}")
+                print(f"  *** Sending reply to WSJT-X at {wsjtx_addr[0]}:{wsjtx_addr[1]} ***")
+                sock.sendto(build_reply(d), wsjtx_addr)
+                sock.close()
+                sys.exit(0)
+
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        sock.close()
+
+
+if __name__ == "__main__":
+    main()
